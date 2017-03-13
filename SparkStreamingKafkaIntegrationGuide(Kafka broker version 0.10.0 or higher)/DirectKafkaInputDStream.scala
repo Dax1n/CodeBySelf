@@ -74,7 +74,13 @@ private[spark] class DirectKafkaInputDStream[K, V](
     super.persist(newLevel)
   }
 
-  //
+
+  /**
+    * executor和broker在同一节点上,如果不在当前executor节点上的话，会发出rpc通信寻找并返回
+    * 尽可能保证在同一节点上，不是绝对保证executor和broker在同一节点上
+    *
+    * @return ju.Map[TopicPartition, String]
+    */
   protected def getBrokers = {
     val c = consumer
     val result = new ju.HashMap[TopicPartition, String]()
@@ -83,16 +89,19 @@ private[spark] class DirectKafkaInputDStream[K, V](
     val assignments = c.assignment().iterator()
     //两层while循环实现获取
     while (assignments.hasNext()) {
+
+      //当前消费者的一个TopicPartition
       val tp: TopicPartition = assignments.next()
 
       //当前的TopicPartition的主机地址没有的话，需要根据去kafka集群查找该TopicPartition的主机地址
-      if (null == hosts.get(tp)) {
+      if (null == hosts.get(tp)) {//该消费者的分区是否找到了对应的主机地址，如果没有找到进行查找
         //partitionsFor获取给定topic和partition的元数据，如果本地没有会发起rpc
-        val infos = c.partitionsFor(tp.topic).iterator()
+        // 因为partitionsFor现在本地查找，如果本地没有的话发出rpc所以保证了优先executor和broker都在本地
+        val infos = c.partitionsFor(tp.topic).iterator()//该消费者的分区没有找到了对应的主机地址，进行查找
         while (infos.hasNext()) {
-          val i = infos.next()
+          val partitionInfo:PartitionInfo = infos.next()
           //TopicPartition重写了equals方法
-          hosts.put(new TopicPartition(i.topic(), i.partition()), i.leader.host())
+          hosts.put(new TopicPartition(partitionInfo.topic(), partitionInfo.partition()), partitionInfo.leader.host())
         }
       }
       //TopicPartition重写了equals方法，所以可以hosts.get(tp)
@@ -211,6 +220,13 @@ private[spark] class DirectKafkaInputDStream[K, V](
     }.getOrElse(offsets)
   }
 
+  /**
+    *
+    * 该方法是有streamingContext.start方法间接最后调用的
+    *
+    * @param validTime
+    * @return
+    */
   override def compute(validTime: Time): Option[KafkaRDD[K, V]] = {
     val untilOffsets = clamp(latestOffsets())
     val offsetRanges = untilOffsets.map { case (tp, uo) =>
@@ -218,6 +234,7 @@ private[spark] class DirectKafkaInputDStream[K, V](
       OffsetRange(tp.topic, tp.partition, fo, uo)
     }
     val rdd = new KafkaRDD[K, V](
+  //   getPreferredHosts 就是位置策略
       context.sparkContext, executorKafkaParams, offsetRanges.toArray, getPreferredHosts, true)
 
     // Report the record number and metadata of this batch interval to InputInfoTracker.
